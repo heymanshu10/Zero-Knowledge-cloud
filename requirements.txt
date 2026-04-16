@@ -1,0 +1,5 @@
+# Crypto Module — Dependencies
+# Install with: pip install -r requirements.txt
+
+cryptography>=42.0.0   # AES-256-GCM, PBKDF2
+pytest>=8.0.0          # test runner
