@@ -1,102 +1,127 @@
-# Crypto Module — ZK Semantic Cloud Storage
+# Semantic Search Module — ZK Cloud Storage
 
-This module handles **all cryptography** for the project.
-The server never sees plaintext, keys, or passwords.
+This module handles **all meaning-based search** for the project.  
+The server never sees plaintext, filenames, queries, or keys.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-pytest test_crypto.py -v   # all tests must pass
+pytest test_semantic_search.py -v   # all tests must pass
 ```
 
 ---
 
-## For the Developer (backend teammate)
+## Architecture
 
-You need three things from this module per file upload:
+```
+CLIENT DEVICE                          SERVER
+─────────────────────────────          ──────────────────────────
+┌─────────────────────────┐            ┌──────────────────────────┐
+│ embedder.py             │            │ search_api.py            │
+│                         │            │                          │
+│ 1. extract_text()       │  upload    │ POST /embeddings         │
+│    → raw text           │ ─────────► │   stores (file_id, vec)  │
+│                         │            │                          │
+│ 2. Embedder.embed_file()│            │                          │
+│    → 384-d vector       │            │ vector_store.py          │
+│                         │            │   FAISS IndexFlatIP      │
+│ 3. crypto.encrypt_file()│            │   cosine similarity ANN  │
+│    → ciphertext + nonce │            │                          │
+│                         │  search    │ POST /search             │
+│ 4. Embedder.embed_query()─ ─────────►│   returns [file_ids]     │
+│    (query stays local)  │            │   (no plaintext ever)    │
+│                         │◄───────────│                          │
+│ 5. crypto.decrypt_file()│            └──────────────────────────┘
+│    → plaintext          │
+└─────────────────────────┘
+```
 
-| What | How to get it | Where to store it |
-|------|--------------|-------------------|
-| `salt` | From `derive_key()` at registration | DB: `users.kdf_salt` (base64) |
-| `nonce` | From `encrypt_file()` | DB: `files.nonce` (base64) |
-| `ciphertext` | From `encrypt_file()` | S3 / blob storage |
+## File Overview
 
-### API payload the client sends on upload:
-```json
-{
-  "file_id": "uuid-string",
-  "ciphertext": "<base64url bytes>",
-  "nonce": "<base64url bytes>",
-  "embedding": [0.12, -0.44, 0.03, ...],
-  "filename_encrypted": "<base64>",
-  "filename_nonce": "<base64>"
+| File | Runs on | Responsibility |
+|------|---------|----------------|
+| `embedder.py` | **Client** | Text extraction + embedding generation |
+| `vector_store.py` | **Server** | FAISS ANN index (add / search / delete) |
+| `search_api.py` | **Server** | FastAPI REST endpoints |
+| `test_semantic_search.py` | Dev | Full test suite (no GPU needed) |
+
+---
+
+## For the Crypto teammate
+
+Your workflow per file upload:
+
+```python
+from embedder import Embedder
+from crypto import derive_key, encrypt_file, encrypt_string
+
+embedder = Embedder()   # load once at app startup
+
+# --- on upload ---
+key, salt = derive_key("user_password")
+
+with open("document.pdf", "rb") as f:
+    file_bytes = f.read()
+
+# 1. Generate embedding BEFORE encryption (you need plaintext)
+embedding = embedder.embed_file(file_bytes, "document.pdf")   # list[float], len=384
+
+# 2. Encrypt the file
+ciphertext, nonce = encrypt_file(file_bytes, key)
+
+# 3. Encrypt the filename
+enc_name, name_nonce = encrypt_string("document.pdf", key)
+
+# 4. Build upload payload
+payload = {
+    "file_id":           "uuid-string",
+    "ciphertext":        ciphertext,          # → S3
+    "nonce":             nonce,               # → DB
+    "embedding":         embedding,           # → vector store (via /embeddings)
+    "filename_encrypted": enc_name,
+    "filename_nonce":    name_nonce,
 }
 ```
 
-### Auth endpoint must return:
+## For the Backend teammate
+
+Start the search server:
+
+```bash
+uvicorn search_api:app --reload --port 8001
+```
+
+### Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/embeddings` | Store embedding on upload |
+| `POST` | `/search` | ANN query, returns file_ids + scores |
+| `DELETE` | `/embeddings/{file_id}` | Purge on file delete (FR-07) |
+| `GET` | `/health` | Health check |
+
+### POST /embeddings
 ```json
-{ "kdf_salt": "<base64 of the user's salt>" }
+{ "file_id": "uuid", "embedding": [0.12, -0.44, ...] }
 ```
-The client uses this salt to re-derive the key on login. Never return the key itself.
 
----
-
-## For the Data Science teammate
-
-Your embedding pipeline runs **before** this module is called.
-
-Workflow per file upload:
-1. You: extract text from file → generate embedding vector (384-d float list)
-2. Me: encrypt the raw file bytes → get (ciphertext, nonce)
-3. Developer: upload both to server
-
-Your output should be a plain Python list of floats, e.g.:
-```python
-embedding = model.encode(text).tolist()  # list[float], len=384
+### POST /search
+```json
+{ "query_embedding": [0.05, 0.91, ...], "top_k": 10, "min_score": 0.3 }
 ```
-That list goes directly into the upload payload alongside the ciphertext.
-
----
-
-## Quick Usage Reference
-
-```python
-from crypto import derive_key, encrypt_file, decrypt_file, encrypt_string, decrypt_string
-
-# --- Registration ---
-key, salt = derive_key("user_password")
-# store salt in DB, key stays in memory only
-
-# --- Encrypt a file ---
-with open("document.pdf", "rb") as f:
-    plaintext = f.read()
-
-ciphertext, nonce = encrypt_file(plaintext, key)
-# upload ciphertext to S3, store nonce in DB
-
-# --- Encrypt filename (so server doesn't see filenames either) ---
-enc_name, name_nonce = encrypt_string("document.pdf", key)
-# store enc_name + name_nonce in DB
-
-# --- Login (new session) ---
-# fetch salt from server, re-derive key
-key, _ = derive_key("user_password", salt=stored_salt)
-
-# --- Decrypt file ---
-plaintext = decrypt_file(ciphertext, nonce, key)
-
-# --- Decrypt filename ---
-filename = decrypt_string(enc_name, name_nonce, key)
+Response:
+```json
+{ "results": [{ "file_id": "uuid-1", "score": 0.94 }, ...] }
 ```
 
 ---
 
 ## Security Notes
 
-- **Never send the key to the server** — ever.
-- **Never store the key** in localStorage, a file, or a database.
-- Hold the key in memory only for the duration of the session.
-- The `nonce` is NOT secret — store it openly in the DB.
-- The `salt` is NOT secret — store it openly in the DB.
-- `CryptoError` means wrong key OR tampered ciphertext — show a generic "decryption failed" message to the user, never expose which.
+- The **query text never leaves the client** — only the embedding vector is sent.
+- Embedding vectors **cannot be reversed** to recover original text (NF-03).  
+  The model is high-dimensional (384-d) and many documents map to similar regions.
+- The server stores **only** `(file_id → embedding)` — no filenames, no content.
+- `min_score` defaults to `0.0` (return all). Set to `0.3`–`0.5` in production  
+  to filter noise from unrelated files.
